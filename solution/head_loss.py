@@ -148,9 +148,12 @@ def patch_head_loss():
             return orig_fwd(self, *args, **kwargs)
         kwargs.pop("labels", None)
         kwargs.pop("logits_to_keep", None)
+        _dbg("before-body")
         out = self.model(**kwargs)
+        _dbg("after-body")
         res = _head_loss_3d(out.last_hidden_state, w, ctx["targets"], ctx["valid"],
                             ctx["mask"], ctx["denom"])
+        _dbg("after-head")
         ctx["result"] = res
         return CausalLMOutputWithPast(loss=res["loss"], logits=None)
 
