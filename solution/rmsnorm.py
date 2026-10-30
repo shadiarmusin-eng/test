@@ -83,7 +83,7 @@ class RMSNormFn(torch.autograd.Function):
         block, warps = _cfg(N)
         _rms_bwd[(x2.shape[0],)](dy2, x2, weight, r, dx, dy2.stride(0), x2.stride(0),
                                  dx.stride(0), N, BLOCK=block, num_warps=warps)
-        return dx.view(ctx.shape), None, None
+        return dx.view(ctx.shape), None, None, None
 
 
 _SUPPORTED = (torch.float16, torch.float32)
@@ -103,8 +103,42 @@ def patch_qwen2_rmsnorm():
                 and hidden_states.dtype in _SUPPORTED and w.dtype in _SUPPORTED
                 and w.is_contiguous()):
             eps = getattr(self, "variance_epsilon", getattr(self, "eps", 1e-6))
-            return RMSNormFn.apply(hidden_states, w, float(eps))
+            out16 = (getattr(self, "_soup_fp16_out", False) and hidden_states.dtype == torch.float32
+                and torch.is_autocast_enabled("cuda"))
+            return RMSNormFn.apply(hidden_states, w, float(eps), out16)
         return orig(self, hidden_states)
 
     cls.forward = forward
     cls._soup_fused = True
+
+def patch_fp16_norm_outputs():
+    """Norms inside decoder layers hand fp16 to the projections (final norm stays fp32)."""
+    from transformers.models.qwen2 import modeling_qwen2 as m
+    if getattr(m.Qwen2Model, "_soup_fp16_flags", False):
+        return
+    orig = m.Qwen2Model.__init__
+
+    def __init__(self, *a, **k):
+        orig(self, *a, **k)
+        for layer in self.layers:
+            layer.input_layernorm._soup_fp16_out = True
+            layer.post_attention_layernorm._soup_fp16_out = True
+
+    m.Qwen2Model.__init__ = __init__
+    m.Qwen2Model._soup_fp16_flags = True
+
+
+def patch_peft_input_cast():
+    """peft upcasts fp16 input to fp32 for LoRA; autocast then casts it back. Skip both."""
+    from peft.tuners.tuners_utils import BaseTunerLayer
+    orig = BaseTunerLayer._cast_input_dtype
+    if getattr(orig, "_soup", False):
+        return
+
+    def _cast_input_dtype(self, x, dtype):
+        if x.dtype == torch.float16 and torch.is_autocast_enabled("cuda"):
+            return x
+        return orig(self, x, dtype)
+
+    _cast_input_dtype._soup = True
+    BaseTunerLayer._cast_input_dtype = _cast_input_dtype
