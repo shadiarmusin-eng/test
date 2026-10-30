@@ -16,7 +16,8 @@ def apply_extra():
     except Exception as e:  # noqa: BLE001
         warnings.warn(f"solution extras not loaded: {e}")
         return
-    for fn in (rmsnorm.patch_qwen2_rmsnorm, fused_ce.patch_loss, fused_ce.patch_entropy,
+    for fn in (rmsnorm.patch_qwen2_rmsnorm, rmsnorm.patch_fp16_norm_outputs,
+               rmsnorm.patch_peft_input_cast, fused_ce.patch_loss, fused_ce.patch_entropy,
                nf4.patch_bnb_dequant, head_loss.patch_head_loss):
         try:
             fn()
