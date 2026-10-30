@@ -74,9 +74,10 @@ def set_mask(mask):
     """Called by head_loss.compute_loss before the forward: remember which rows are real."""
     STATE.idx = mask.reshape(-1).nonzero().squeeze(1)
     STATE.total = mask.numel()
-    if _SEEN[0] < 3:  # one-off diagnostic
+    if _SEEN[0] < 8:  # one-off diagnostic
         _SEEN[0] += 1
-        print(f"[solution] pad fraction in batch: {1 - STATE.idx.numel() / STATE.total:.2f}")
+        print(f"[solution] pad fraction {1 - STATE.idx.numel() / STATE.total:.2f}, "
+              f"mask shape {tuple(mask.shape)}")
 
 
 def clear():
