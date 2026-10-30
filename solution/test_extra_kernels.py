@@ -134,7 +134,8 @@ def test_unpad_roundtrip():
     x_ref = x.detach().clone().requires_grad_()
     idx = torch.tensor([0, 1, 2, 5, 6, 12, 13, 19], device="cuda")
     y = RowScatter.apply(RowGather.apply(x, idx) * 2, idx, 20)
-    m = torch.zeros(20, 1, device="cuda"); m[idx] = 1
+    m = torch.zeros(20, 1, device="cuda")
+    m[idx] = 1
     y_ref = x_ref * 2 * m
     torch.testing.assert_close(y, y_ref)
     g = torch.randn_like(y)
