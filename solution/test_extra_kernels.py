@@ -141,3 +141,19 @@ def test_unpad_roundtrip():
     g = torch.randn_like(y)
     y.backward(g); y_ref.backward(g)
     torch.testing.assert_close(x.grad, x_ref.grad)
+    
+@cuda
+@pytest.mark.parametrize("nested", [True, False])
+def test_nf4_patch_transposed(nested):
+    import bitsandbytes.functional as BF
+    from solution.nf4 import patch_bnb_dequant
+    torch.manual_seed(0)
+    W = torch.randn(256, 1536, device="cuda", dtype=torch.float16)
+    q, st = BF.quantize_4bit(W, blocksize=64, compress_statistics=nested, quant_type="nf4")
+    orig = BF.dequantize_4bit
+    patch_bnb_dequant()
+    for A in (q, q.t()):
+        ref = orig(A, st)
+        out = BF.dequantize_4bit(A, st)
+        assert out.shape == ref.shape
+        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
