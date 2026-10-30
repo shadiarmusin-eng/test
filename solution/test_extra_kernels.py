@@ -64,3 +64,24 @@ def test_nf4_dequant(nested):
     out = dequantize_nf4(q, st)
     assert out.shape == ref.shape and out.dtype == ref.dtype
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+@cuda
+def test_head_ce():
+    from solution.head_loss import fused_head_ce
+    torch.manual_seed(0)
+    h = torch.randn(37, 64, device="cuda", requires_grad=True)
+    w = torch.randn(5000, 64, device="cuda") * 0.2
+    tgt = torch.randint(0, 5000, (37,), device="cuda")
+    tgt[::4] = -100
+    loss, s = fused_head_ce(h, w, tgt, denom=20.0, chunk=16)
+    lg = (h.detach().half() @ w.half().t()).float()
+    lp = torch.log_softmax(lg, -1)
+    ref = F.cross_entropy(lg, tgt, ignore_index=-100, reduction="sum") / 20
+    torch.testing.assert_close(loss, ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(s["ent"], -(lp.exp() * lp).sum(-1), rtol=2e-3, atol=2e-3)
+    assert (s["arg"].long() == lg.argmax(-1)).float().mean() > 0.97
+    loss.backward()
+    h2 = h.detach().clone().requires_grad_()
+    lg2 = (h2.half() @ w.half().t()).float()
+    (F.cross_entropy(lg2, tgt, ignore_index=-100, reduction="sum") / 20).backward()
+    torch.testing.assert_close(h.grad, h2.grad, rtol=3e-2, atol=1e-3)
