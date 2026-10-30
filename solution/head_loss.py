@@ -27,7 +27,40 @@ def _dbg(tag):
         _DBG[0] += 1
         print(f"[solution] MEM {tag}: alloc={torch.cuda.memory_allocated() >> 20} MiB "
               f"max={torch.cuda.max_memory_allocated() >> 20} MiB", flush=True)
+ENABLE_EMB16 = True  # поставьте False, чтобы откатить этот шаг
+_EMB_DONE = [False]
 
+
+def _shrink_embedding(model):
+    """Frozen tied embedding/lm_head: store fp16 (values identical), embedding output stays fp32."""
+    if _EMB_DONE[0]:
+        return
+    _EMB_DONE[0] = True
+    try:
+        emb = model.get_input_embeddings()
+        w = emb.weight
+        if w.dtype != torch.float32 or w.requires_grad or not w.is_cuda:
+            print("[solution] emb16: skipped (unexpected dtype/grad)")
+            return
+        before = torch.cuda.memory_allocated() >> 20
+        w16 = w.data.to(torch.float16)
+        for i in range(0, w.shape[0], 16384):  # chunked: no big fp32 temporary
+            if not torch.equal(w16[i:i + 16384].float(), w.data[i:i + 16384]):
+                print("[solution] emb16: not lossless, skipped")
+                return
+        w.data = w16
+        orig_forward = emb.forward
+
+        def forward(input_ids, *a, **k):
+            return orig_forward(input_ids, *a, **k).float()
+
+        emb.forward = forward
+        del w16
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_allocated() >> 20
+        print(f"[solution] emb16: embedding+lm_head now fp16, alloc {before} -> {after} MiB")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[solution] emb16: skipped ({exc!r})")
 
 @triton.jit
 def _head_ce(L, T, LOSS, ENT, ARG, stride, V, GS, IGN: tl.constexpr, BLOCK: tl.constexpr,
@@ -181,6 +214,8 @@ def patch_head_loss():
             denom = float(num_items_in_batch)
         fwd_inputs = {k: v for k, v in inputs.items() if k not in ("labels", "_prediction_loss_only")}
         fwd_inputs["use_cache"] = False
+        if ENABLE_EMB16:
+            _shrink_embedding(model)
         
         # --- Изменения из шага 2.В ---
         from . import unpad
