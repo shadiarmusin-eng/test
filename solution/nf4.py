@@ -33,7 +33,22 @@ def _nf4_deq(A, ABS, CODE, OUT, n_bytes, blocksize, BLOCK: tl.constexpr):
     tl.store(OUT + idx * 2, (c_hi * scale).to(OUT.dtype.element_ty), mask=m)
     tl.store(OUT + idx * 2 + 1, (c_lo * scale).to(OUT.dtype.element_ty), mask=m)
 
-
+@triton.jit
+def _nf4_deq2(A, ABS8, CODE2, ABS2, OFF, CODE, OUT, n_bytes, blocksize, bs2,
+              BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = idx < n_bytes
+    b = tl.load(A + idx, mask=m, other=0).to(tl.int32)
+    blk = (idx * 2) // blocksize
+    q = tl.load(ABS8 + blk, mask=m, other=0).to(tl.int32)
+    s2 = tl.load(ABS2 + blk // bs2, mask=m, other=0.0)
+    scale = tl.load(CODE2 + q) * s2 + tl.load(OFF)
+    c_hi = tl.load(CODE + (b >> 4))
+    c_lo = tl.load(CODE + (b & 15))
+    tl.store(OUT + idx * 2, (c_hi * scale).to(OUT.dtype.element_ty), mask=m)
+    tl.store(OUT + idx * 2 + 1, (c_lo * scale).to(OUT.dtype.element_ty), mask=m)
+                  
 def _code(device):
     key = str(device)
     if key not in _CODE:
@@ -43,21 +58,21 @@ def _code(device):
 
 
 def dequantize_nf4(A, st):
-    import bitsandbytes.functional as BF
-    if st.nested:
-        absmax = BF.dequantize_blockwise(st.absmax, st.state2)
-        absmax = absmax + st.offset
-        if absmax.dtype != torch.float32:
-            absmax = absmax.float()
-    else:
-        absmax = st.absmax.float()
-    absmax = absmax.contiguous()
     flat = A.reshape(-1)
     out = torch.empty(st.shape, dtype=st.dtype, device=A.device)
     n_bytes = flat.numel()
     block = 1024
-    _nf4_deq[(triton.cdiv(n_bytes, block),)](flat, absmax, _code(A.device), out, n_bytes,
-                                             st.blocksize, BLOCK=block, num_warps=4)
+    grid = (triton.cdiv(n_bytes, block),)
+    if st.nested:
+        s2 = st.state2
+        offset = torch.as_tensor(st.offset, dtype=torch.float32, device=A.device).reshape(1)
+        _nf4_deq2[grid](flat, st.absmax.contiguous(), s2.code.float().contiguous(),
+                        s2.absmax.float().contiguous(), offset, _code(A.device), out,
+                        n_bytes, st.blocksize, s2.blocksize, BLOCK=block, num_warps=4)
+    else:
+        absmax = st.absmax.float().contiguous()
+        _nf4_deq[grid](flat, absmax, _code(A.device), out, n_bytes,
+                       st.blocksize, BLOCK=block, num_warps=4)
     return out
 
 
