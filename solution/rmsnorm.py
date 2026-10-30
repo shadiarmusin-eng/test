@@ -8,6 +8,8 @@ to the input dtype -> multiply by the (fp32) weight.  Here all of that is ONE
 kernel and the backward recomputes from x and the saved per-row rstd, so no fp32
 copies of the activations are kept alive.  Norm weights are frozen under LoRA,
 so no weight gradient is computed; if a weight requires grad we fall back.
+With out_fp16=True the kernel writes fp16 directly (the projections run in fp16
+under autocast anyway), which removes the fp32->fp16 cast kernels after the norm.
 """
 import torch
 import triton
@@ -56,7 +58,7 @@ def _cfg(N):
 
 class RMSNormFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, eps):
+    def forward(ctx, x, weight, eps, out_fp16=False):
         shape = x.shape
         N = shape[-1]
         x2 = x.reshape(-1, N)
@@ -103,13 +105,15 @@ def patch_qwen2_rmsnorm():
                 and hidden_states.dtype in _SUPPORTED and w.dtype in _SUPPORTED
                 and w.is_contiguous()):
             eps = getattr(self, "variance_epsilon", getattr(self, "eps", 1e-6))
-            out16 = (getattr(self, "_soup_fp16_out", False) and hidden_states.dtype == torch.float32
-                and torch.is_autocast_enabled("cuda"))
+            out16 = (getattr(self, "_soup_fp16_out", False)
+                     and hidden_states.dtype == torch.float32
+                     and torch.is_autocast_enabled("cuda"))
             return RMSNormFn.apply(hidden_states, w, float(eps), out16)
         return orig(self, hidden_states)
 
     cls.forward = forward
     cls._soup_fused = True
+
 
 def patch_fp16_norm_outputs():
     """Norms inside decoder layers hand fp16 to the projections (final norm stays fp32)."""
