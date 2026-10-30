@@ -21,7 +21,7 @@ def test_rmsnorm(xdt):
     x_ref = x.detach().clone().requires_grad_()
     w = torch.rand(1536, device="cuda") + 0.5
     dy = torch.randn(3, 37, 1536, device="cuda")
-    y = RMSNormFn.apply(x, w, 1e-6)
+    y = RMSNormFn.apply(x, w, 1e-6, False)
     y_ref = ref_rmsnorm(x_ref, w, 1e-6)
     assert y.dtype == y_ref.dtype
     torch.testing.assert_close(y, y_ref, rtol=2e-3, atol=2e-3)
@@ -85,3 +85,19 @@ def test_head_ce():
     lg2 = (h2.half() @ w.half().t()).float()
     (F.cross_entropy(lg2, tgt, ignore_index=-100, reduction="sum") / 20).backward()
     torch.testing.assert_close(h.grad, h2.grad, rtol=3e-2, atol=1e-3)
+
+@cuda
+def test_rmsnorm_fp16_out():
+    from solution.rmsnorm import RMSNormFn
+    torch.manual_seed(0)
+    x = (torch.randn(3, 37, 1536, device="cuda") * 2).requires_grad_()  # fp32 input
+    x_ref = x.detach().clone().requires_grad_()
+    w = torch.rand(1536, device="cuda") + 0.5
+    dy = torch.randn(3, 37, 1536, device="cuda")
+    y = RMSNormFn.apply(x, w, 1e-6, True)
+    y_ref = ref_rmsnorm(x_ref, w, 1e-6)
+    assert y.dtype == torch.float16
+    torch.testing.assert_close(y.float(), y_ref, rtol=5e-3, atol=5e-3)
+    y.backward(dy.half())
+    y_ref.backward(dy)
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=3e-2, atol=3e-2)
