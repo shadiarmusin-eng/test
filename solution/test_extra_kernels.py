@@ -125,3 +125,18 @@ def test_add_rmsnorm(out16):
     ((s_ref * ds).sum() + (y_ref * dy).sum()).backward()
     torch.testing.assert_close(r.grad, r_ref.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(a.grad.float(), a_ref.grad.float(), rtol=3e-2, atol=3e-2)
+
+@cuda
+def test_unpad_roundtrip():
+    from solution.unpad import RowGather, RowScatter
+    torch.manual_seed(0)
+    x = torch.randn(20, 64, device="cuda", requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+    idx = torch.tensor([0, 1, 2, 5, 6, 12, 13, 19], device="cuda")
+    y = RowScatter.apply(RowGather.apply(x, idx) * 2, idx, 20)
+    m = torch.zeros(20, 1, device="cuda"); m[idx] = 1
+    y_ref = x_ref * 2 * m
+    torch.testing.assert_close(y, y_ref)
+    g = torch.randn_like(y)
+    y.backward(g); y_ref.backward(g)
+    torch.testing.assert_close(x.grad, x_ref.grad)
