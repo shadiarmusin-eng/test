@@ -169,12 +169,22 @@ def patch_head_loss():
             denom = float(num_items_in_batch)
         fwd_inputs = {k: v for k, v in inputs.items() if k not in ("labels", "_prediction_loss_only")}
         fwd_inputs["use_cache"] = False
+        
+        # --- Изменения из шага 2.В ---
+        from . import unpad
+        unpad.set_mask(mask)
+        # ----------------------------
+
         _STATE.ctx = {"targets": targets, "valid": valid, "mask": mask, "denom": denom}
         try:
             outputs = model(**fwd_inputs)
         finally:
+            # --- Изменения из шага 2.В ---
+            unpad.clear()
+            # ----------------------------
             c = _STATE.ctx
             _STATE.ctx = None
+            
         res = c.get("result")
         if res is None:
             print("[solution] head_loss: fast path not used, falling back")
