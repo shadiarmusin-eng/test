@@ -19,6 +19,15 @@ _BLOCK = 4096
 _SCALE = 1024.0  # keeps small fp16 gradients from underflowing; divided out in fp32
 _STATE = threading.local()
 
+_DBG = [0]
+
+
+def _dbg(tag):
+    if _DBG[0] < 12:
+        _DBG[0] += 1
+        print(f"[solution] MEM {tag}: alloc={torch.cuda.memory_allocated() >> 20} MiB "
+              f"max={torch.cuda.max_memory_allocated() >> 20} MiB", flush=True)
+
 
 @triton.jit
 def _head_ce(L, T, LOSS, ENT, ARG, stride, V, GS, IGN: tl.constexpr, BLOCK: tl.constexpr,
