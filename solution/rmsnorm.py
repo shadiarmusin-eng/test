@@ -62,7 +62,7 @@ class RMSNormFn(torch.autograd.Function):
         x2 = x.reshape(-1, N)
         if x2.stride(-1) != 1:
             x2 = x2.contiguous()
-        out_dtype = torch.promote_types(x.dtype, weight.dtype)
+        out_dtype = torch.float16 if out_fp16 else torch.promote_types(x.dtype, weight.dtype)
         y = torch.empty(x2.shape, dtype=out_dtype, device=x.device)
         r = torch.empty(x2.shape[0], dtype=torch.float32, device=x.device)
         block, warps = _cfg(N)
