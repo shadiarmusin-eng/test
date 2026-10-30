@@ -4,6 +4,9 @@ The logits [rows, 151936] are never kept: rows go through the head 512 at a time
 a chunk of logits and produces per-row loss, entropy, argmax and (in a second pass over the same
 row) the gradient (softmax - onehot) in place; then dh = dlogits @ W. Pad rows are dropped first.
 
+The frozen tied embedding / lm_head is stored in fp16 (checked to be lossless at start-up);
+the embedding output is cast back to fp32, so values stay the same.
+
 Idea source: online softmax (Milakov & Gimelshein, 2018); the idea of chunking the head+loss is
 the general "fused linear cross-entropy" idea. No code copied from other projects.
 """
@@ -19,15 +22,7 @@ _BLOCK = 4096
 _SCALE = 1024.0  # keeps small fp16 gradients from underflowing; divided out in fp32
 _STATE = threading.local()
 
-_DBG = [0]
-
-
-def _dbg(tag):
-    if _DBG[0] < 12:
-        _DBG[0] += 1
-        print(f"[solution] MEM {tag}: alloc={torch.cuda.memory_allocated() >> 20} MiB "
-              f"max={torch.cuda.max_memory_allocated() >> 20} MiB", flush=True)
-ENABLE_EMB16 = True  # поставьте False, чтобы откатить этот шаг
+ENABLE_EMB16 = True  # False = keep the embedding in fp32 (rollback switch)
 _EMB_DONE = [False]
 
 
@@ -61,6 +56,7 @@ def _shrink_embedding(model):
         print(f"[solution] emb16: embedding+lm_head now fp16, alloc {before} -> {after} MiB")
     except Exception as exc:  # noqa: BLE001
         print(f"[solution] emb16: skipped ({exc!r})")
+
 
 @triton.jit
 def _head_ce(L, T, LOSS, ENT, ARG, stride, V, GS, IGN: tl.constexpr, BLOCK: tl.constexpr,
@@ -181,12 +177,9 @@ def patch_head_loss():
             return orig_fwd(self, *args, **kwargs)
         kwargs.pop("labels", None)
         kwargs.pop("logits_to_keep", None)
-        _dbg("before-body")
         out = self.model(**kwargs)
-        _dbg("after-body")
         res = _head_loss_3d(out.last_hidden_state, w, ctx["targets"], ctx["valid"],
                             ctx["mask"], ctx["denom"])
-        _dbg("after-head")
         ctx["result"] = res
         return CausalLMOutputWithPast(loss=res["loss"], logits=None)
 
@@ -212,26 +205,23 @@ def patch_head_loss():
             denom = float((targets != -100).sum().clamp(min=1))
         else:
             denom = float(num_items_in_batch)
-        fwd_inputs = {k: v for k, v in inputs.items() if k not in ("labels", "_prediction_loss_only")}
+        fwd_inputs = {k: v for k, v in inputs.items()
+                      if k not in ("labels", "_prediction_loss_only")}
         fwd_inputs["use_cache"] = False
         if ENABLE_EMB16:
             _shrink_embedding(model)
-        
-        # --- Изменения из шага 2.В ---
+
         from . import unpad
         unpad.set_mask(mask)
-        # ----------------------------
 
         _STATE.ctx = {"targets": targets, "valid": valid, "mask": mask, "denom": denom}
         try:
             outputs = model(**fwd_inputs)
         finally:
-            # --- Изменения из шага 2.В ---
             unpad.clear()
-            # ----------------------------
             c = _STATE.ctx
             _STATE.ctx = None
-            
+
         res = c.get("result")
         if res is None:
             print("[solution] head_loss: fast path not used, falling back")
