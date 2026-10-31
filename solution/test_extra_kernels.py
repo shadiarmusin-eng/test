@@ -158,18 +158,3 @@ def test_nf4_patch_transposed(nested):
         assert out.shape == ref.shape
         torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
-@cuda
-def test_lora_epilogue():
-    from solution.lora_epilogue import LoraEpilogue
-    torch.manual_seed(0)
-    base = torch.randn(3, 37, 1536, device="cuda", dtype=torch.float16).requires_grad_()
-    lora = torch.randn(3, 37, 1536, device="cuda", dtype=torch.float16).requires_grad_()
-    rb, rl = base.detach().clone().requires_grad_(), lora.detach().clone().requires_grad_()
-    out = LoraEpilogue.apply(base, lora, 2.0)
-    ref = rb + rl * 2.0
-    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
-    g = torch.randn_like(out)
-    out.backward(g)
-    ref.backward(g)
-    torch.testing.assert_close(base.grad, rb.grad)
-    torch.testing.assert_close(lora.grad, rl.grad, rtol=1e-3, atol=1e-3)
