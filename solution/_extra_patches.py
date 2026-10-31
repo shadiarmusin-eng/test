@@ -12,7 +12,7 @@ def apply_extra():
         import torch
         if not torch.cuda.is_available():  # Soup's unit tests may run without a GPU
             return
-        from . import fused_ce, head_loss, lora_epilogue, nf4, rmsnorm, unpad
+        from . import fused_ce, head_loss, nf4, rmsnorm, unpad
     except Exception as e:  # noqa: BLE001
         warnings.warn(f"solution extras not loaded: {e}")
         return
