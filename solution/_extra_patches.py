@@ -12,7 +12,7 @@ def apply_extra():
         import torch
         if not torch.cuda.is_available():  # Soup's unit tests may run without a GPU
             return
-        from . import fused_ce, head_loss, nf4, rmsnorm, unpad
+        from . import fused_ce, head_loss, lora_epilogue, nf4, rmsnorm, unpad
     except Exception as e:  # noqa: BLE001
         warnings.warn(f"solution extras not loaded: {e}")
         return
@@ -20,7 +20,8 @@ def apply_extra():
                rmsnorm.patch_decoder_add_norm, rmsnorm.patch_peft_input_cast,
                fused_ce.patch_loss, fused_ce.patch_entropy,
                nf4.patch_bnb_dequant, head_loss.patch_head_loss,
-               unpad.patch_mlp_unpad):  # last: it wraps the MLP forward installed by the example
+               lora_epilogue.patch_lora_epilogue,
+               unpad.patch_mlp_unpad):
         try:
             fn()
             print(f"[solution] OK: {fn.__name__}")
