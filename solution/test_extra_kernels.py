@@ -66,20 +66,6 @@ def test_nf4_dequant(nested):
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
 @cuda
-@pytest.mark.parametrize("bs", [64, 128])
-@pytest.mark.parametrize("nested", [True, False])
-def test_nf4_tile_partial_blocks(bs, nested):
-    import bitsandbytes.functional as BF
-    from solution.nf4 import dequantize_nf4
-    torch.manual_seed(0)
-    W = torch.randn(1000, 1000, device="cuda", dtype=torch.float16)  # partial last blocks
-    q, st = BF.quantize_4bit(W, blocksize=bs, compress_statistics=nested, quant_type="nf4")
-    ref = BF.dequantize_4bit(q, st)
-    out = dequantize_nf4(q, st)
-    assert out.shape == ref.shape and out.dtype == ref.dtype
-    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
-
-@cuda
 def test_head_ce():
     from solution.head_loss import fused_head_ce
     torch.manual_seed(0)

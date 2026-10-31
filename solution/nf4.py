@@ -1,50 +1,56 @@
 """NF4 de-quantisation kernel in Triton (written from scratch).
 
-bitsandbytes NF4 layout: each byte holds two 4-bit codes (high nibble first); every `blocksize`
-elements share one absmax. With double quantisation the absmax values are 8-bit indices into a
-256-entry table, with one fp32 scale per 256 blocks.
+bitsandbytes unpacks a 4-bit NF4 weight to a dense fp16 matrix before every matmul
+(forward and backward, ~5% of a training step on this task).  This file does the same
+unpacking with our own kernel: each byte holds two 4-bit codes (high nibble first),
+every 64-element block has one fp32 scale ("absmax"; with double quantisation the
+scales are first restored by bitsandbytes' own small routine), value = code[idx] * absmax.
 
-This kernel handles NBLK quantisation blocks per program: the absmax of a block is computed once
-and used for all its bytes (the previous version gathered it for every byte).
-Anything unusual falls back to the original bitsandbytes function.
+Idea source: the NF4 format of QLoRA (Dettmers et al., 2023) and bitsandbytes' public
+documentation of its layout.  The kernel itself is our own code.
+Anything unusual (other quant type, transposed weight, out= given, ...) falls back to
+the original bitsandbytes function.
 """
-import atexit
-import sys
-import traceback
-
 import torch
 import triton
 import triton.language as tl
 
-NBLK = 16  # quantisation blocks per program
-STATS = {"triton": 0, "bnb": 0}
 _CODE = {}
 _BROKEN = False
 
 
 @triton.jit
-def _nf4_tile(A, Q, CODE2, S2, OFF, CODE, OUT, n_bytes, n_blk, n_out,
-              BS2: tl.constexpr, NBLK: tl.constexpr, BPS2: tl.constexpr,
-              NESTED: tl.constexpr):
+def _nf4_deq(A, ABS, CODE, OUT, n_bytes, blocksize, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    rb = pid * NBLK + tl.arange(0, NBLK)                  # quantisation block ids
-    bm = rb < n_blk
-    if NESTED:
-        q = tl.load(Q + rb, mask=bm, other=0).to(tl.int32)
-        s2 = tl.load(S2 + rb // BPS2, mask=bm, other=0.0)
-        scale = tl.load(CODE2 + q, mask=bm, other=0.0) * s2 + tl.load(OFF)
-    else:
-        scale = tl.load(Q + rb, mask=bm, other=0.0)
-    c = tl.arange(0, BS2)
+    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = idx < n_bytes
+    b = tl.load(A + idx, mask=m, other=0).to(tl.int32)
+    hi = b >> 4
+    lo = b & 15
+    scale = tl.load(ABS + (idx * 2) // blocksize, mask=m, other=0.0)
+    c_hi = tl.load(CODE + hi)
+    c_lo = tl.load(CODE + lo)
+    tl.store(OUT + idx * 2, (c_hi * scale).to(OUT.dtype.element_ty), mask=m)
+    tl.store(OUT + idx * 2 + 1, (c_lo * scale).to(OUT.dtype.element_ty), mask=m)
+
+@triton.jit
+def _nf4_deq2(A, ABS8, CODE2, ABS2, OFF, CODE, OUT, n_bytes, blocksize, bs2,
+              BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)   # индекс байта
+    m = idx < n_bytes
+    b = tl.load(A + idx, mask=m, other=0).to(tl.int32)
+    blk = (idx * 2) // blocksize
+    q = tl.load(ABS8 + blk, mask=m, other=0).to(tl.int32)
+    s2 = tl.load(ABS2 + blk // bs2, mask=m, other=0.0)
+    scale = tl.load(CODE2 + q) * s2 + tl.load(OFF)
     j = tl.arange(0, 2)
-    byte = rb[:, None, None] * BS2 + c[None, :, None]     # [NBLK, BS2, 1]
-    b = tl.load(A + byte, mask=byte < n_bytes, other=0).to(tl.int32)
-    nib = (b >> ((1 - j[None, None, :]) * 4)) & 15         # [NBLK, BS2, 2], high nibble first
-    val = tl.load(CODE + nib) * scale[:, None, None]
-    o = byte * 2 + j[None, None, :]                       # output element index
-    tl.store(OUT + o, val.to(OUT.dtype.element_ty), mask=o < n_out)
-
-
+    nib = (b[:, None] >> ((1 - j[None, :]) * 4)) & 15      # старший полубайт первым
+    code = tl.load(CODE + nib)
+    val = code * scale[:, None]
+    o = idx[:, None] * 2 + j[None, :]
+    tl.store(OUT + o, val.to(OUT.dtype.element_ty), mask=m[:, None])
+                  
 def _code(device):
     key = str(device)
     if key not in _CODE:
@@ -53,48 +59,23 @@ def _code(device):
     return _CODE[key]
 
 
-def _aux(st, device):
-    a = getattr(st, "_soup_nf4", None)
-    if a is not None:
-        return a
-    if st.nested:
-        s2 = st.state2
-        a = dict(
-            Q=st.absmax.contiguous(),
-            S2=s2.absmax.float().contiguous(),
-            CODE2=s2.code.float().contiguous(),
-            OFF=torch.as_tensor(st.offset, dtype=torch.float32, device=device).reshape(1).contiguous(),
-            BPS2=int(s2.blocksize), NESTED=True)
-    else:
-        q = st.absmax.float().contiguous()
-        a = dict(Q=q, S2=q, CODE2=q, OFF=q, BPS2=1, NESTED=False)
-    try:
-        st._soup_nf4 = a  # cache: the weights are frozen
-    except Exception:  # noqa: BLE001
-        pass
-    return a
-
-
 def dequantize_nf4(A, st):
-    bs = int(st.blocksize)
-    bs2 = bs // 2
-    if bs2 & (bs2 - 1):
-        raise ValueError("blocksize must be a power of two")
-    numel = st.shape.numel()
     flat = A.reshape(-1)
     out = torch.empty(st.shape, dtype=st.dtype, device=A.device)
-    n_blk = triton.cdiv(numel, bs)
-    a = _aux(st, A.device)
-    _nf4_tile[(triton.cdiv(n_blk, NBLK),)](
-        flat, a["Q"], a["CODE2"], a["S2"], a["OFF"], _code(A.device), out,
-        flat.numel(), n_blk, numel,
-        BS2=bs2, NBLK=NBLK, BPS2=a["BPS2"], NESTED=a["NESTED"], num_warps=4)
+    n_bytes = flat.numel()
+    block = 1024
+    grid = (triton.cdiv(n_bytes, block),)
+    if st.nested:
+        s2 = st.state2
+        offset = torch.as_tensor(st.offset, dtype=torch.float32, device=A.device).reshape(1)
+        _nf4_deq2[grid](flat, st.absmax.contiguous(), s2.code.float().contiguous(),
+                        s2.absmax.float().contiguous(), offset, _code(A.device), out,
+                        n_bytes, st.blocksize, s2.blocksize, BLOCK=block, num_warps=4)
+    else:
+        absmax = st.absmax.float().contiguous()
+        _nf4_deq[grid](flat, absmax, _code(A.device), out, n_bytes,
+                       st.blocksize, BLOCK=block, num_warps=4)
     return out
-
-
-def _report():
-    print(f"[solution] nf4 dequant calls: triton={STATS['triton']} "
-          f"bnb={STATS['bnb']} broken={_BROKEN}")
 
 
 def patch_bnb_dequant():
@@ -112,22 +93,17 @@ def patch_bnb_dequant():
                 and A.is_cuda and A.dtype == torch.uint8
                 and getattr(st, "quant_type", None) == "nf4"
                 and st.dtype in (torch.float16, torch.float32)
-                and st.blocksize % 2 == 0 and st.shape.numel() == 2 * A.numel()
-                and 2 * A.numel() < 2 ** 31):
+                and st.blocksize % 2 == 0 and st.shape.numel() == 2 * A.numel()):
             try:
                 res = dequantize_nf4(A, st)
-                STATS["triton"] += 1
                 return res.t() if A.shape[0] == 1 else res
             except Exception:  # never break training because of the speed-up
                 _BROKEN = True
-                print("[solution] nf4: Triton path failed, bitsandbytes from now on:")
-                traceback.print_exc()
-        STATS["bnb"] += 1
         return orig(A, quant_state, absmax, out, blocksize, quant_type)
 
     dequantize_4bit._soup_fused = True
     BF.dequantize_4bit = dequantize_4bit
+    import sys
     for name, mod in list(sys.modules.items()):
         if name.startswith("bitsandbytes") and getattr(mod, "dequantize_4bit", None) is orig:
             mod.dequantize_4bit = dequantize_4bit
-    atexit.register(_report)
