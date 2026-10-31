@@ -20,7 +20,6 @@ def apply_extra():
                rmsnorm.patch_decoder_add_norm, rmsnorm.patch_peft_input_cast,
                fused_ce.patch_loss, fused_ce.patch_entropy,
                nf4.patch_bnb_dequant, head_loss.patch_head_loss,
-               lora_epilogue.patch_lora_epilogue,
                unpad.patch_mlp_unpad):
         try:
             fn()
