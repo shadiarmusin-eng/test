@@ -21,6 +21,3 @@ def apply():
 
     from ._extra_patches import apply_extra
     apply_extra()
-
-    from . import _prof  # TEMPORARY: profiling, remove before submission
-    _prof.install()
